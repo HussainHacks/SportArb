@@ -1,0 +1,186 @@
+# Paper Trading Module — Code Review
+
+## Verdict
+
+The implementation **correctly measures arbitrage survival** and follows most design rules well. The exact-matching logic, status progression, and reporter metrics are solid. However, there are **3 bugs**, **2 concurrency risks**, and **1 stale data issue** that should be fixed before production use.
+
+---
+
+## ✅ Design Rule Compliance
+
+| Rule | Status | Notes |
+|---|---|---|
+| 1. Recording | ✅ Pass | All required fields frozen correctly |
+| 2. Exact Matching | ✅ Pass | [_find_exact_leg](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_rechecker.py#125-151) matches operator, selection, market, period, line |
+| 3. Rechecking at 5s/10s/30s | ⚠️ Bug | Skipped interval problem (see Bug 1) |
+| 4. Failure Conditions | ✅ Pass | Missing line, suspension, movement all handled |
+| 5. Status Progression | ✅ Pass | All 7 states present, terminal states correct |
+| 6. Reporter | ✅ Pass | All metrics computed correctly |
+| 7. Invariants | ✅ Pass | `frozen_arb` is never mutated; rechecks use exact matching |
+
+---
+
+## 🐛 Bugs
+
+### Bug 1: Broken trade still gets rechecked at later intervals (Medium)
+
+**File**: [paper_trade_rechecker.py](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_rechecker.py#L93-L112)
+
+The [_process_pending_trades](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_rechecker.py#81-124) method iterates through `RECHECK_INTERVALS` looking for missing snapshots. If a trade breaks at 5s, it's marked terminal and filtered out of [pending_trades](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_recorder.py#47-51) — that part is fine.
+
+**But**: the interval selection loop (lines 99–108) finds the *last* due interval, not the *first*. If a trade is 35s old but hasn't been checked at all (e.g., rechecker was briefly stalled), it will jump straight to checking 30s, skipping 5s and 10s entirely.
+
+```python
+# Current: overwrites next_interval, so last match wins
+for interval in RECHECK_INTERVALS:  # [5, 10, 30]
+    if age_seconds >= interval:
+        if interval == 5 and trade.snapshot_5s is None:
+            next_interval = 5
+        elif interval == 10 and trade.snapshot_10s is None:
+            next_interval = 10   # overwrites 5
+        elif interval == 30 and trade.snapshot_30s is None:
+            next_interval = 30   # overwrites 10
+```
+
+**Fix**: Add a `break` after the first match, or change to find the *earliest* missing interval:
+
+```python
+for interval in RECHECK_INTERVALS:
+    if age_seconds >= interval:
+        if interval == 5 and trade.snapshot_5s is None:
+            next_interval = 5
+            break
+        elif interval == 10 and trade.snapshot_10s is None:
+            next_interval = 10
+            break
+        elif interval == 30 and trade.snapshot_30s is None:
+            next_interval = 30
+            break
+```
+
+**Impact**: Without this, if the rechecker falls behind, you get a 30s snapshot with no 5s or 10s data, corrupting your survival rate calculations.
+
+---
+
+### Bug 2: [pending_trades](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_recorder.py#47-51) returns copies but mutations happen on originals (Low)
+
+**File**: [paper_trade_recorder.py](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_recorder.py#L47-L50)
+
+```python
+@property
+def pending_trades(self) -> list[PaperTrade]:
+    return [t for t in self._trades if not t.is_terminal]
+```
+
+This creates a new list but the [PaperTrade](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_models.py#83-218) objects inside are the **same references** (dataclasses are mutable). So mutations in the rechecker do update the original objects. This is actually correct behavior here — but it's fragile. If someone later changes [PaperTrade](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_models.py#83-218) to an immutable type or adds `copy()`, the rechecker will silently break.
+
+**Recommendation**: Add a comment clarifying this is intentional, or don't wrap in a list comprehension for the rechecker's use.
+
+---
+
+### Bug 3: `recorder.record()` stores `legs[0].period` but total markets have period "full_game" (Low)
+
+**File**: [paper_trade_recorder.py](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_recorder.py#L80)
+
+```python
+period=legs[0].period if legs else "",
+```
+
+For 2-way arbs where legs have different periods (unlikely but possible with misconfigured data), only leg A's period is stored. The rechecker then matches both legs against this single period. This is technically correct given upstream normalization (both legs in a group share the same period), but there's no assertion validating this invariant.
+
+---
+
+## ⚡ Concurrency Issues
+
+### Race 1: Recorder and rechecker share mutable state without synchronization
+
+**Files**: [main.py](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/main.py#L48-L49), rechecker, recorder
+
+```python
+# main.py — both are module-level globals
+paper_recorder = PaperTradeRecorder(...)
+paper_rechecker = PaperTradeRechecker(paper_recorder, ...)
+```
+
+The scan loop calls `paper_recorder.record_batch()` which appends to `self._trades`. Simultaneously, the rechecker's [_process_pending_trades()](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_rechecker.py#81-124) reads `self._trades` and mutates individual trades. Both run in the **same asyncio event loop**, which provides cooperative concurrency — so there's no true data race. However:
+
+> [!WARNING]
+> If you ever add `await` calls inside [_recheck_trade](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_rechecker.py#152-257) (e.g., for logging to a DB), you create a yield point where the recorder could append new trades mid-iteration. This would **not** crash (you're iterating a snapshot from [pending_trades](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_recorder.py#47-51)), but it's a latent risk.
+
+**Recommendation**: No fix needed now, but add a comment in the rechecker noting the single-event-loop assumption.
+
+### Race 2: [stop()](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_rechecker.py#64-70) doesn't cancel the task, it waits for natural exit
+
+**File**: [paper_trade_rechecker.py](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_rechecker.py#L64-L69)
+
+```python
+async def stop(self):
+    self._is_running = False
+    if self._task:
+        await self._task
+```
+
+If the rechecker is in the middle of a Redis fetch ([get_all_odds_for_event](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/storage/redis_cache.py#62-71)), [stop()](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_rechecker.py#64-70) blocks until that completes. During shutdown, Redis might already be closed (line 217 of [main.py](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/main.py) closes Redis), causing an unhandled exception.
+
+**Fix**: Use `self._task.cancel()` with a try/except for `CancelledError`, or ensure Redis closes *after* the rechecker stops. The current [main.py](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/main.py) shutdown order is actually correct (rechecker stops first at line 212, Redis closes at line 217), but only if no Redis call is in-flight when `_is_running` is set to False.
+
+---
+
+## 📊 Stale Data Risk
+
+### Redis odds can be stale during rechecker fetch
+
+**File**: [redis_cache.py](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/storage/redis_cache.py#L22)
+
+```python
+self._ttl = settings.stale_odds_seconds * 2  # 120s TTL
+```
+
+The rechecker fetches odds from Redis at the 5s/10s/30s marks. But Redis keys have a 120s TTL. If the scanner hasn't refreshed odds for a while (e.g., API rate limit hit), the rechecker could validate a recheck against odds that are 90 seconds old — far older than the 5s/10s/30s window it's measuring.
+
+> [!IMPORTANT]
+> **This is the most impactful issue.** A trade could show as "survived 30s" when in reality the Redis data hadn't been refreshed since the original alert. The rechecker would just re-read the same stale odds and conclude the arb is still valid.
+
+**Fix**: In [_recheck_trade](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_rechecker.py#152-257), check the `timestamp` field on the fetched [NormalizedOdds](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/normalization/models.py#27-45). If the live odds timestamp is older than the trade's `created_at`, the recheck is invalid — the data predates the alert itself.
+
+```python
+# After finding both legs:
+if leg_a.timestamp <= trade.created_at or leg_b.timestamp <= trade.created_at:
+    trade.mark_broken(
+        PaperTradeStatus.BROKEN_BY_MISSING_LINE,
+        f"Stale odds: data predates alert",
+        interval,
+    )
+    return
+```
+
+---
+
+## 🔧 Robustness Improvements
+
+| # | Improvement | Priority | Effort |
+|---|---|---|---|
+| 1 | **Fix interval skipping** (Bug 1) | 🔴 High | 1 line |
+| 2 | **Add stale-odds guard** in rechecker | 🔴 High | 5 lines |
+| 3 | **Log total pending count** each rechecker cycle | 🟡 Medium | 1 line |
+| 4 | **Add `__init__.py`** to paper_trading package | 🟢 Low | 1 file |
+| 5 | **Cap [_trades](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_recorder.py#47-51) list growth** with a max size or ring buffer | 🟡 Medium | 10 lines |
+| 6 | **Add rechecker metrics**: total rechecks, avg recheck latency | 🟡 Medium | 15 lines |
+| 7 | **Log which specific leg was suspended** in break detail | 🟢 Low | 3 lines |
+
+### On item 5 — unbounded memory growth:
+
+The [_trades](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_recorder.py#47-51) list in [PaperTradeRecorder](file:///c:/Users/ahmed/OneDrive/Desktop/sportsarb/backend/paper_trading/paper_trade_recorder.py#27-145) grows forever. Over a 24-hour session with 100+ alerts, this is fine. Over a multi-day run, it's a slow memory leak. Consider either:
+- A max size with FIFO eviction
+- Periodic flush to disk/DB after trades reach terminal state
+
+---
+
+## ✅ What's Done Well
+
+- **Exact matching** is strict and correct — operator, selection, market, period, line all matched
+- **`frozen_arb`** is a full `model_dump` snapshot that's never mutated — clean audit trail
+- **Break reasons** are stored as both enum and human string — good for both code and logs
+- **Reporter metrics** cover all the right dimensions (survival rates, decay, operator pairs)
+- **3-way market support** is properly handled throughout
+- **Event-level grouping** in the rechecker minimizes Redis round-trips
